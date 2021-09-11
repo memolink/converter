@@ -18,7 +18,7 @@ function durationToMs(duration) {
 	return seconds * 1000
 }
 
-async function setupAuth() {
+async function setup() {
 	try {
 		key = await fs.readFile('./key.txt', { encoding: 'utf8' })
 	} catch (err) {
@@ -29,6 +29,12 @@ async function setupAuth() {
 
 	console.log('your key is: ', key)
 
+	await fs.mkdir('./temp').catch(err => {
+		if (!err.message.includes('EEXIST')) throw err
+	})
+
+	await fs.rm('./temp/*', { recursive: true, force: true })
+
 	app.listen(4000, () => console.log(`listening on ${ip.address()}:4000`))
 }
 
@@ -37,101 +43,108 @@ app.use(async (req, res, next) => {
 	else next()
 })
 
-app.post('/photo', async (req, res, next) => {
+app.post('/temp/:id/cleanup', async (req, res, next) => {
 	try {
-		const command = sharp().rotate().webp()
-
-		switch (req.query.preset) {
-			case 'full':
-				break
-			case 'thumb':
-				command.resize(220)
-				break
-			default:
-				return next(createError(400, 'Preset not supported'))
-		}
-
-		console.log('converting image with preset: ', req.query.preset)
-
-		req.pipe(command).pipe(res)
+		await fs.rm(`./temp/${req.params.id}`, { recursive: true, force: true })
+		res.status(200).end()
 	} catch (err) {
 		next(err)
 	}
 })
 
-app.post('/video', async (req, res, next) => {
+app.get('/temp/:id/:preset', async (req, res, next) => {
+	res.sendFile(`./temp/${req.params.id}/${req.params.preset}`, { root: __dirname })
+})
+
+app.post('/convert/:type', async (req, res, next) => {
+	const id = uuid.v4()
+	const cleanup = () => fs.rm(`./temp/${id}`, { recursive: true, force: true })
+
 	try {
 		let contentType
 		let totalDuration
 
-		let cleanup = () => {}
-		let source = req
-		if (!req.query.streamable) {
-			source = './temp/' + uuid.v4()
-			const writeStream = createWriteStream(source)
-			await new Promise(res => req.pipe(writeStream).on('close', res))
-			cleanup = fs.unlink(source)
+		await fs.mkdir(`./temp/${id}`)
+
+		const source = `./temp/${id}/source`
+
+		const writeStream = createWriteStream(source)
+		await new Promise(res => req.pipe(writeStream).on('close', res))
+
+		console.log('presets: ', req.query.presets)
+
+		function convertPhoto(preset) {
+			const command = sharp(source).rotate().webp()
+
+			switch (preset) {
+				case 'full':
+					break
+				case 'thumb':
+					command.resize(220)
+					break
+				default:
+					return false
+			}
+
+			return command.toFile(`./temp/${id}/${preset}`)
 		}
 
-		const command = ffmpeg(source)
+		function convertVideo(preset) {
+			return new Promise((res, rej) => {
+				const command = ffmpeg(source)
 
-		switch (req.query.preset) {
-			case 'full':
-				contentType = 'mp4'
-				command.format(contentType).videoCodec('h264_nvenc').addOutputOption('-movflags', 'frag_keyframe+empty_moov')
-				break
-			case 'thumb':
-				contentType = 'webp'
-				command.format(contentType).size('220x?').frames(1).noAudio()
-				break
-			case 'thumbvideo':
-				contentType = 'mp4'
-				totalDuration = 5000
-				command
-					.format(contentType)
-					.videoCodec('h264_nvenc')
-					.size('480x?')
-					.noAudio()
-					.outputFPS(30)
-					.duration(5)
-					.addOutputOption('-movflags', 'frag_keyframe+empty_moov')
-				break
-			default:
-				cleanup()
-				return next(createError(400, 'Preset not supported'))
-		}
-
-		command
-			.on('end', async () => {
-				console.log('file has been converted succesfully')
-				cleanup()
-			})
-			.on('error', async err => {
-				console.log('an error happened: ' + err.message)
-				next(err)
-				cleanup()
-			})
-			.on('start', cmd => {
-				console.log('started: ', cmd)
-			})
-			.on('codecData', codecData => {
-				console.log('codecData: ', codecData)
-				if (!totalDuration && codecData.duration !== 'N/A') totalDuration = durationToMs(codecData.duration)
-			})
-			.on('progress', progress => {
-				if (!res.headersSent) {
-					res.contentType(contentType)
-					passStream.pipe(res)
+				switch (preset) {
+					case 'full':
+						contentType = 'mp4'
+						command.format(contentType).videoCodec('h264_nvenc')
+						break
+					case 'thumb':
+						contentType = 'webp'
+						command.format(contentType).size('220x?').frames(1).noAudio()
+						break
+					case 'thumbvideo':
+						contentType = 'mp4'
+						totalDuration = 5000
+						command.format(contentType).videoCodec('h264_nvenc').size('480x?').noAudio().outputFPS(30).duration(5)
+						break
+					default:
+						return res(false)
 				}
 
-				if (totalDuration) console.log('progress: ', durationToMs(progress.timemark) / totalDuration)
+				command
+					.on('end', async () => {
+						console.log('file has been converted succesfully')
+						res(true)
+					})
+					.on('error', async err => {
+						console.log('an error happened: ' + err.message)
+						rej(err)
+					})
+					.on('start', cmd => {
+						console.log('started: ', cmd)
+					})
+					.on('codecData', codecData => {
+						console.log('codecData: ', codecData)
+						if (!totalDuration && codecData.duration !== 'N/A') totalDuration = durationToMs(codecData.duration)
+					})
+					.on('progress', progress => {
+						if (totalDuration) console.log('progress: ', durationToMs(progress.timemark) / totalDuration)
+					})
+					.save(`./temp/${id}/${preset}`)
 			})
+		}
 
-		const passStream = new stream.PassThrough()
-		const dataStream = command.pipe(passStream, { end: true })
+		await Promise.all(req.query.presets.map(req.params.type === 'video' ? convertVideo : convertPhoto))
+
+		await fs.rm(source, { recursive: true, force: true })
+
+		res.send({ id })
+
+		setTimeout(cleanup, 1000 * 60 * 2)
 	} catch (err) {
+		await cleanup()
 		next(err)
 	}
 })
 
-setupAuth()
+setup()
